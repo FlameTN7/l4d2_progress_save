@@ -7,9 +7,9 @@
 #include <l4d2_nativevote>
 #include <multicolors>
 
-#define PLUGIN_VERSION "1.0.0"
+#define PLUGIN_VERSION "0.1"
 #define PLUGIN_NAME    "L4D2 Progress Save Load"
-#define PLUGIN_AUTHOR  "l4d2 server"
+#define PLUGIN_AUTHOR  "FlameTN7"
 
 #define MAX_SURVIVORS  8
 #define SLOT_PRIMARY   0
@@ -32,7 +32,7 @@ ConVar g_cvAlignBotsLimit;
 ConVar g_cvDebug;
 
 bool g_bVoteActive = false;
-bool g_bSaveActive = false; // 本图已读档激活,持续自动套用家底(含团灭重开)
+bool g_bSaveActive = false; 
 char g_sPendingLoad[PLATFORM_MAX_PATH]; // 等待恢复的存档文件路径
 
 // ============ 存档数据结构 ============
