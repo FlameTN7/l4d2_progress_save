@@ -33,6 +33,8 @@ ConVar g_cvDebug;
 
 bool g_bVoteActive = false;
 bool g_bSaveActive = false; 
+bool g_bSaving;
+ArrayList g_saveClients; // 一次存档的客户端队列
 char g_sPendingLoad[PLATFORM_MAX_PATH]; // 等待恢复的存档文件路径
 
 // ============ 存档数据结构 ============
@@ -104,6 +106,13 @@ public void OnMapStart()
 public void OnMapEnd()
 {
 	g_bSaveActive = false;
+	Save_Clear();
+}
+
+public void OnClientDisconnect(int client)
+{
+	if (g_bSaving && g_saveClients.FindValue(client) != -1)
+		Save_Clear();
 }
 
 // ============ 命令 ============
@@ -183,6 +192,12 @@ public Action Command_Save(int client, int args)
 			CPrintToChat(client, "{green}[进度]{default}只能在出生安全区内保存进度(用于map开头的存档节点).");
 			return Plugin_Handled;
 		}
+	}
+
+	if (g_bSaving)
+	{
+		CPrintToChat(client, "{green}[进度]{default}正在保存进度,请稍候.");
+		return Plugin_Handled;
 	}
 
 	CPrintToChat(client, "{green}[进度]{default}正在保存进度...");
@@ -289,6 +304,7 @@ void DoLoad()
 	GetCurrentMap(map, sizeof(map));
 
 	// 读取存档到内存
+	Save_Clear(); // 保存与读档共用 g_asaved,停止旧保存回调再读入
 	if (!ReadSaveData(g_sPendingLoad))
 	{
 		CPrintToChatAll("{green}[进度]{olive}读档失败:存档文件损坏或不匹配.");
@@ -330,6 +346,7 @@ void DoLoad()
 // ============ round 恢复 ============
 public void Event_RoundStartPostNav(Event event, const char[] name, bool dontBroadcast)
 {
+	Save_Clear(); // 不能把上一回合未完成的保存写入新回合
 	// 本图激活的存档持续套用(读档后的首次重启 + 之后团灭重开都自动生效)
 	if (!g_bSaveActive)
 		return;
@@ -613,14 +630,18 @@ void SetPlayerAmmoByType(int client, int weapon, int ammo)
 }
 
 // ============ 存档(异步读取武器) ============
-// 一次存档的客户端队列
-ArrayList g_saveClients;
+int g_saveGeneration;
 int g_savePhase[MAXPLAYERS + 1]; // 当前读取槽位:0主 1副 2投掷 3完成
 char g_savePath[PLATFORM_MAX_PATH];
 int g_saveSlotIdx[MAXPLAYERS + 1];
 
 bool SaveProgress()
 {
+	if (g_bSaving)
+		return false;
+	Save_Clear();
+	g_bSaving = true;
+
 	char map[64];
 	GetCurrentMap(map, sizeof(map));
 
@@ -653,16 +674,19 @@ bool SaveProgress()
 	strcopy(g_sSavedMode, sizeof(g_sSavedMode), mode);
 
 	// 收集队伍client,记录槽位
-	if (g_saveClients == null)
-		Save_Clear();
 	for (int i = 1; i <= MaxClients; i++)
 	{
 		if (!IsClientInGame(i) || GetClientTeam(i) != 2)
 			continue;
+		if (g_saveClients.Length >= MAX_SURVIVORS)
+		{
+			Save_Clear();
+			CPrintToChatAll("{green}[进度]{default}保存失败:最多支持 %d 名生还者.", MAX_SURVIVORS);
+			return false;
+		}
 		g_saveClients.Push(i);
 		g_savePhase[i] = 0; // 从主武器开始
-		if (g_saveClients.Length <= MAX_SURVIVORS)
-			g_saveSlotIdx[i] = g_saveClients.Length - 1;
+		g_saveSlotIdx[i] = g_saveClients.Length - 1;
 	}
 
 	// 立即读取各client静止项(血量/医疗/药等), 武器弹药走异步
@@ -677,6 +701,8 @@ bool SaveProgress()
 
 void Save_Clear()
 {
+	g_bSaving = false;
+	g_saveGeneration++; // 已排队的回调只属于原来的保存批次
 	if (g_saveClients == null)
 		g_saveClients = new ArrayList();
 	for (int i = 0; i < g_saveClients.Length; i++)
@@ -715,11 +741,18 @@ void Save_CollectStatic()
 // 读取下一个需要切武器看的槽位(主/副/投掷),通过 use 让武器active后下帧读
 void Save_ReadNextWeapon()
 {
+	if (!g_bSaving)
+		return;
 	for (int i = 0; i < g_saveClients.Length; i++)
 	{
 		int c = g_saveClients.Get(i);
 		if (g_savePhase[c] > 2)
 			continue;
+		if (!IsClientInGame(c) || GetClientTeam(c) != 2)
+		{
+			Save_Clear();
+			return;
+		}
 		int slot = g_savePhase[c]; // 0主 1副 2投掷
 		int ent = GetPlayerWeaponSlot(c, slot);
 		if (ent <= MaxClients)
@@ -747,16 +780,23 @@ void Save_ReadNextWeapon()
 
 		FakeClientCommand(c, "use %s", cls);
 		// 稍后读取(给切换武器留时间)
-		CreateTimer(0.1, Save_TimerReadClip, c, TIMER_FLAG_NO_MAPCHANGE);
+		DataPack pack;
+		CreateDataTimer(0.1, Save_TimerReadClip, pack, TIMER_FLAG_NO_MAPCHANGE);
+		pack.WriteCell(g_saveGeneration);
+		pack.WriteCell(GetClientUserId(c));
 		return; // 一次只处理一个,其余下轮
 	}
 	// 全部完成,写文件
 	Save_WriteFile();
 }
 
-public Action Save_TimerReadClip(Handle timer, int c)
+public Action Save_TimerReadClip(Handle timer, DataPack pack)
 {
-	if (!IsClientInGame(c))
+	pack.Reset();
+	if (pack.ReadCell() != g_saveGeneration || !g_bSaving)
+		return Plugin_Stop;
+	int c = GetClientOfUserId(pack.ReadCell());
+	if (!g_cvEnable.BoolValue || !IsValidClient(c) || GetClientTeam(c) != 2)
 	{
 		Save_Clear();
 		return Plugin_Stop;
@@ -774,6 +814,13 @@ void Save_CollectWeaponAmmo(int c)
 		return;
 	int idx = g_saveSlotIdx[c];
 	int ent = GetPlayerWeaponSlot(c, slot);
+	if (ent <= MaxClients || !IsValidEntity(ent))
+	{
+		// 等待切换武器期间可能被丢弃或移除,中止并释放保存状态
+		Save_Clear();
+		CPrintToChatAll("{green}[进度]{default}保存失败:武器发生变化,请重试.");
+		return;
+	}
 	SurvivorSave save;
 		save = g_asaved[idx];
 
@@ -842,6 +889,8 @@ void Save_ReadMeleeKind(int client, char[] kind, int maxlen)
 
 void Save_WriteFile()
 {
+	if (!g_bSaving)
+		return;
 	if (g_cvDebug.BoolValue)
 	{
 		for (int i = 0; i < g_iSavedSurvivorCount; i++)
